@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>六级阅读段落总结练习</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header>
+    <h1>六级阅读段落总结练习</h1>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <!-- Font size control -->
+  <div class="font-control">
+    <label>字体大小:</label>
+    <input type="range" id="fontSlider" min="14" max="32" value="18" step="1">
+    <span id="fontDisplay">18px</span>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <select id="typeSelect">
+      <option value="仔细阅读">仔细阅读 (推荐)</option>
+      <option value="长篇阅读">长篇阅读匹配</option>
+      <option value="选词填空">选词填空</option>
+    </select>
+    <button id="drawBtn">抽题</button>
+    <button id="historyBtn" class="btn-secondary">练习记录</button>
+  </div>
+
+  <!-- Paragraph display -->
+  <div id="paragraphArea" class="hidden">
+    <div class="meta" id="metaLine"></div>
+    <div class="context hidden" id="contextLine"></div>
+    <div class="passage" id="passageText"></div>
+  </div>
+
+  <!-- Scaffolding buttons -->
+  <div id="scaffoldingArea" class="hidden">
+    <div class="scaffold-buttons">
+      <button id="scafGlossary">单词释义</button>
+      <button id="scafSplit">拆分长句</button>
+      <button id="scafContext">上下文提示</button>
+    </div>
+    <div id="scaffoldResult" class="scaffold-result hidden"></div>
+  </div>
+
+  <!-- Summary input -->
+  <div id="summaryArea" class="hidden">
+    <label for="summaryInput">你的中文总结（50字以内）:</label>
+    <textarea id="summaryInput" rows="3" placeholder="请用中文简要总结本段的大意..."></textarea>
+    <button id="submitBtn">提交反馈</button>
+  </div>
+
+  <!-- Feedback -->
+  <div id="feedbackArea" class="hidden">
+    <h3>AI反馈</h3>
+    <div id="feedbackContent"></div>
+  </div>
+
+  <!-- History modal -->
+  <div id="historyModal" class="modal hidden">
+    <div class="modal-content">
+      <span class="close" id="closeModal">&times;</span>
+      <h2>练习记录</h2>
+      <div id="historyList"></div>
+    </div>
+  </div>
+
+  <!-- Loading spinner -->
+  <div id="loading" class="hidden">
+    <div class="spinner"></div>
+    <span>处理中，请稍候...</span>
+  </div>
+
+</div>
+
+<script>
+const ROOT = document.documentElement;
+const FONT_SLIDER = document.getElementById('fontSlider');
+const FONT_DISPLAY = document.getElementById('fontDisplay');
+const STATS = document.getElementById('stats');
+const TYPE_SELECT = document.getElementById('typeSelect');
+const DRAW_BTN = document.getElementById('drawBtn');
+const PARAGRAPH_AREA = document.getElementById('paragraphArea');
+const META_LINE = document.getElementById('metaLine');
+const CONTEXT_LINE = document.getElementById('contextLine');
+const PASSAGE_TEXT = document.getElementById('passageText');
+const SCAFFOLDING_AREA = document.getElementById('scaffoldingArea');
+const SCAFFOLD_RESULT = document.getElementById('scaffoldResult');
+const SUMMARY_AREA = document.getElementById('summaryArea');
+const SUMMARY_INPUT = document.getElementById('summaryInput');
+const SUBMIT_BTN = document.getElementById('submitBtn');
+const FEEDBACK_AREA = document.getElementById('feedbackArea');
+const FEEDBACK_CONTENT = document.getElementById('feedbackContent');
+const LOADING = document.getElementById('loading');
+const HISTORY_MODAL = document.getElementById('historyModal');
+const HISTORY_LIST = document.getElementById('historyList');
+const CLOSE_MODAL = document.getElementById('closeModal');
+const HISTORY_BTN = document.getElementById('historyBtn');
+
+let currentParagraph = null;
+let scaffoldingUsed = [];
+
+// --- Font control ---
+const savedFont = localStorage.getItem('cet6-font-size') || '18';
+ROOT.style.setProperty('--font-size', savedFont + 'px');
+FONT_SLIDER.value = savedFont;
+FONT_DISPLAY.textContent = savedFont + 'px';
+
+FONT_SLIDER.addEventListener('input', function() {
+  const size = this.value + 'px';
+  ROOT.style.setProperty('--font-size', size);
+  FONT_DISPLAY.textContent = size;
+  localStorage.setItem('cet6-font-size', this.value);
+});
+
+// --- Loading ---
+function showLoading() { LOADING.classList.remove('hidden'); }
+function hideLoading() { LOADING.classList.add('hidden'); }
+
+// --- API helpers ---
+async function api(url, data) {
+  showLoading();
+  try {
+    const opts = { headers: {'Content-Type': 'application/json'}};
+    if (data) {
+      opts.method = 'POST';
+      opts.body = JSON.stringify(data);
+    }
+    const resp = await fetch(url, opts);
+    return await resp.json();
+  } finally {
+    hideLoading();
+  }
+}
+
+// --- Stats ---
+async function loadStats() {
+  const data = await api('/api/stats');
+  let html = '题库: ';
+  for (const [type, info] of Object.entries(data.by_type)) {
+    html += `${type} ${info.total}段(剩${info.remaining}) `;
+  }
+  html += `| 已练习 ${data.practiced} 题`;
+  STATS.innerHTML = html;
+}
+
+// --- Draw paragraph ---
+async function drawParagraph() {
+  const ptype = TYPE_SELECT.value;
+  const data = await api('/api/random_paragraph', {type: ptype});
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  currentParagraph = data;
+  scaffoldingUsed = [];
+
+  META_LINE.innerHTML = `${data.type}  ${data.title} &nbsp;|&nbsp; ${data.source}`;
+  if (data.type === '仔细阅读') {
+    META_LINE.innerHTML += ` &nbsp;|&nbsp; 段落 ${data.paragraph_index}/${data.total_paragraphs}`;
+  }
+
+  const ctx = data.previous_context;
+  if (data.type === '仔细阅读' && ctx) {
+    CONTEXT_LINE.innerHTML = `<strong>上文:</strong> ${ctx}`;
+    CONTEXT_LINE.classList.remove('hidden');
+  } else {
+    CONTEXT_LINE.classList.add('hidden');
+  }
+
+  PASSAGE_TEXT.textContent = data.paragraph_text;
+  PARAGRAPH_AREA.classList.remove('hidden');
+  SCAFFOLDING_AREA.classList.remove('hidden');
+  SUMMARY_AREA.classList.remove('hidden');
+  FEEDBACK_AREA.classList.add('hidden');
+  SCAFFOLD_RESULT.classList.add('hidden');
+  SUMMARY_INPUT.value = '';
+}
+
+// --- Scaffolding ---
+document.getElementById('scafGlossary').addEventListener('click', async function() {
+  if (!currentParagraph) return;
+  SCAFFOLD_RESULT.innerHTML = '<em>获取中...</em>';
+  SCAFFOLD_RESULT.classList.remove('hidden');
+  const data = await api('/api/scaffolding/glossary', {text: currentParagraph.paragraph_text});
+  SCAFFOLD_RESULT.innerHTML = '<strong>[关键词释义]</strong><br>' + data.result.replace(/\n/g, '<br>');
+  scaffoldingUsed.push('glossary');
+});
+
+document.getElementById('scafSplit').addEventListener('click', async function() {
+  if (!currentParagraph) return;
+  SCAFFOLD_RESULT.innerHTML = '<em>拆分中...</em>';
+  SCAFFOLD_RESULT.classList.remove('hidden');
+  const data = await api('/api/scaffolding/split', {text: currentParagraph.paragraph_text});
+  SCAFFOLD_RESULT.innerHTML = '<strong>[长句拆分]</strong><br>' + data.result.replace(/\n/g, '<br>');
+  scaffoldingUsed.push('splitting');
+});
+
+document.getElementById('scafContext').addEventListener('click', async function() {
+  if (!currentParagraph) return;
+  SCAFFOLD_RESULT.innerHTML = '<em>获取中...</em>';
+  SCAFFOLD_RESULT.classList.remove('hidden');
+  const data = await api('/api/scaffolding/context', {
+    text: currentParagraph.paragraph_text,
+    item: currentParagraph
+  });
+  SCAFFOLD_RESULT.innerHTML = '<strong>[上下文提示]</strong><br>' + data.result.replace(/\n/g, '<br>');
+  scaffoldingUsed.push('context');
+});
+
+// --- Submit summary ---
+SUBMIT_BTN.addEventListener('click', async function() {
+  const summary = SUMMARY_INPUT.value.trim();
+  if (!summary) { alert('请先输入你的总结！'); return; }
+  if (!currentParagraph) return;
+
+  FEEDBACK_CONTENT.innerHTML = '<em>分析中...</em>';
+  FEEDBACK_AREA.classList.remove('hidden');
+
+  const data = await api('/api/feedback', {
+    passage_id: currentParagraph.id,
+    type: currentParagraph.type,
+    source: currentParagraph.source,
+    title: currentParagraph.title,
+    paragraph_index: currentParagraph.paragraph_index,
+    scaffolding_used: scaffoldingUsed,
+    text: currentParagraph.paragraph_text,
+    context: currentParagraph.previous_context,
+    summary: summary,
+  });
+
+  if (data.error) {
+    FEEDBACK_CONTENT.innerHTML = '<span class="error">' + data.error + '</span>';
+    return;
+  }
+
+  FEEDBACK_CONTENT.innerHTML = data.result.replace(/\n/g, '<br>');
+  loadStats();
+});
+
+// --- History modal ---
+HISTORY_BTN.addEventListener('click', async function() {
+  const data = await api('/api/history');
+  if (!data.length) {
+    HISTORY_LIST.innerHTML = '<p class="empty">暂无练习记录。</p>';
+  } else {
+    let html = '';
+    for (const entry of data.slice().reverse()) {
+      html += `<div class="history-entry">
+        <div class="h-meta">${entry.datetime} | ${entry.type} | ${entry.title || entry.passage_id}</div>
+        <div class="h-summary"><strong>我的总结:</strong> ${entry.my_summary}</div>
+        <div class="h-feedback">${entry.ai_feedback.replace(/\n/g, '<br>')}</div>
+      </div>`;
+    }
+    HISTORY_LIST.innerHTML = html;
+  }
+  HISTORY_MODAL.classList.remove('hidden');
+});
+
+CLOSE_MODAL.addEventListener('click', function() {
+  HISTORY_MODAL.classList.add('hidden');
+});
+window.addEventListener('click', function(e) {
+  if (e.target === HISTORY_MODAL) HISTORY_MODAL.classList.add('hidden');
+});
+
+// --- Event bindings ---
+DRAW_BTN.addEventListener('click', drawParagraph);
+
+// --- Init ---
+loadStats();
+</script>
+
+</body>
+</html>
