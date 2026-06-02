@@ -10,10 +10,11 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
-load_dotenv(r'../.env')
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
-RAW_DIR = r'../知识库/reading_raw'
-OUT_PATH = r'../知识库/六级阅读段落库.json'
+RAW_DIR = os.path.join(_PROJECT_ROOT, '知识库/reading_raw')
+OUT_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
 MODEL = 'deepseek-chat'

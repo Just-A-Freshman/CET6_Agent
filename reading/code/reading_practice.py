@@ -10,10 +10,11 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 from openai import OpenAI
 from dotenv import load_dotenv
 
-load_dotenv(r'../.env')
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
-DB_PATH = r'../知识库/六级阅读段落库.json'
-HISTORY_PATH = r'../知识库/六级阅读练习记录.json'
+DB_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
+HISTORY_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读练习记录.json')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
 MODEL = 'deepseek-chat'
@@ -190,7 +191,7 @@ def get_ai_feedback(paragraph_text, previous_context, user_summary):
         '1. 准确性：总结中有没有事实性错误或理解偏差？\n'
         '2. 完整性：是否覆盖了段落的核心信息？有没有遗漏关键点？\n'
         '3. 核心观点：是否准确抓住了段落主旨？\n\n'
-        '最后给出一个参考中文总结（50字以内）。\n'
+        '最后给出一个参考中文总结。\n'
         '格式：\n'
         '准确性：xxx\n'
         '完整性：xxx\n'
@@ -269,7 +270,7 @@ def run_practice():
             else:
                 print('无效选择。')
 
-        print('\n请用中文简要总结本段的大意（50字以内）:')
+        print('\n请用中文简要总结本段的大意:')
         user_summary = input('总结: ').strip()
         if not user_summary:
             print('跳过本段。')

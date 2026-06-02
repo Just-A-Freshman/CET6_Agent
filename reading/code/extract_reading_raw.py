@@ -8,8 +8,8 @@ import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 from pypdf import PdfReader
 
-PDF_DIR = r'd:\Learning\English\英语六级\题目\近10年六级真题'
-OUT_DIR = r'd:\Learning\English\英语六级\知识库\reading_raw'
+PDF_DIR = r'D:\Learning\English\英语六级\题目\近10年六级真题'
+OUT_DIR = r'../知识库/reading_raw'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
