@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>六级阅读段落总结练习</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
 
@@ -30,6 +31,7 @@
       <option value="长篇阅读">长篇阅读匹配</option>
       <option value="选词填空">选词填空</option>
     </select>
+    <button id="penBtn" class="btn-draw" title="画笔标注 (Ctrl+Z 撤销)">画笔</button>
     <button id="drawBtn">抽题</button>
     <button id="historyBtn" class="btn-secondary">练习记录</button>
   </div>
@@ -38,17 +40,35 @@
   <div id="paragraphArea" class="hidden">
     <div class="meta" id="metaLine"></div>
     <div class="context hidden" id="contextLine"></div>
-    <div class="passage" id="passageText"></div>
+    <div class="passage-container"><div class="passage" id="passageText"></div></div>
+    <!-- Note panel -->
+    <div class="note-panel" id="notePanel">
+      <div class="note-toggle" id="noteToggle">笔记</div>
+      <div class="note-body hidden" id="noteBody">
+        <textarea id="noteInput" rows="4" placeholder="记录你对本段落的思考和笔记..."></textarea>
+        <button id="noteSaveBtn" class="btn-secondary note-save-btn">保存笔记</button>
+        <span id="noteStatus" class="note-status"></span>
+      </div>
+    </div>
   </div>
 
   <!-- Scaffolding buttons -->
   <div id="scaffoldingArea" class="hidden">
     <div class="scaffold-buttons">
       <button id="scafGlossary">单词释义</button>
-      <button id="scafSplit">拆分长句</button>
+      <select id="splitDimension" class="split-select">
+        <option value="">无</option>
+        <option value="sense-group">意群拆分</option>
+        <option value="constituent">成分拆分</option>
+        <option value="content">内容拆分</option>
+      </select>
+      <button id="restoreBtn" class="btn-secondary restore-btn hidden">还原原文</button>
       <button id="scafContext">上下文提示</button>
     </div>
-    <div id="scaffoldResult" class="scaffold-result hidden"></div>
+    <div id="scaffoldResult" class="scaffold-result hidden">
+      <span class="scaffold-close" id="scaffoldClose">&times;</span>
+      <div id="scaffoldContent"></div>
+    </div>
   </div>
 
   <!-- Summary input -->
@@ -88,12 +108,20 @@ const FONT_DISPLAY = document.getElementById('fontDisplay');
 const STATS = document.getElementById('stats');
 const TYPE_SELECT = document.getElementById('typeSelect');
 const DRAW_BTN = document.getElementById('drawBtn');
+const PEN_BTN = document.getElementById('penBtn');
 const PARAGRAPH_AREA = document.getElementById('paragraphArea');
 const META_LINE = document.getElementById('metaLine');
 const CONTEXT_LINE = document.getElementById('contextLine');
 const PASSAGE_TEXT = document.getElementById('passageText');
 const SCAFFOLDING_AREA = document.getElementById('scaffoldingArea');
 const SCAFFOLD_RESULT = document.getElementById('scaffoldResult');
+const SCAFFOLD_CONTENT = document.getElementById('scaffoldContent');
+const NOTE_PANEL = document.getElementById('notePanel');
+const NOTE_TOGGLE = document.getElementById('noteToggle');
+const NOTE_BODY = document.getElementById('noteBody');
+const NOTE_INPUT = document.getElementById('noteInput');
+const NOTE_SAVE_BTN = document.getElementById('noteSaveBtn');
+const NOTE_STATUS = document.getElementById('noteStatus');
 const SUMMARY_AREA = document.getElementById('summaryArea');
 const SUMMARY_INPUT = document.getElementById('summaryInput');
 const SUBMIT_BTN = document.getElementById('submitBtn');
@@ -105,8 +133,22 @@ const HISTORY_LIST = document.getElementById('historyList');
 const CLOSE_MODAL = document.getElementById('closeModal');
 const HISTORY_BTN = document.getElementById('historyBtn');
 
+const SPLIT_DIMENSION = document.getElementById('splitDimension');
+const RESTORE_BTN = document.getElementById('restoreBtn');
+
 let currentParagraph = null;
 let scaffoldingUsed = [];
+let originalPassageText = null;
+
+// --- Canvas drawing state ---
+let drawCanvas = null;
+let drawCtx = null;
+let isDrawMode = false;
+let isDrawing = false;
+let strokes = [];       // Array<Array<{x, y}>>
+let drawResizeObserver = null;
+let canvasW = 0;        // CSS-pixel width
+let canvasH = 0;        // CSS-pixel height
 
 // --- Font control ---
 const savedFont = localStorage.getItem('cet6-font-size') || '18';
@@ -120,6 +162,14 @@ FONT_SLIDER.addEventListener('input', function() {
   FONT_DISPLAY.textContent = size;
   localStorage.setItem('cet6-font-size', this.value);
 });
+
+// --- Markdown helper ---
+function md(text) {
+  if (typeof marked === 'undefined') {
+    return text.replace(/\n/g, '<br>');
+  }
+  return marked.parse(text, {breaks: true, gfm: true});
+}
 
 // --- Loading ---
 function showLoading() { LOADING.classList.remove('hidden'); }
@@ -154,6 +204,8 @@ async function loadStats() {
 
 // --- Draw paragraph ---
 async function drawParagraph() {
+  // Clear canvas drawing state
+  clearDrawing();
   const ptype = TYPE_SELECT.value;
   const data = await api('/api/random_paragraph', {type: ptype});
   if (data.error) {
@@ -177,43 +229,83 @@ async function drawParagraph() {
   }
 
   PASSAGE_TEXT.textContent = data.paragraph_text;
+  originalPassageText = data.paragraph_text;
+  RESTORE_BTN.classList.add('hidden');
+  SPLIT_DIMENSION.value = '';
   PARAGRAPH_AREA.classList.remove('hidden');
+  // Init canvas overlay after the paragraph area is visible (needs layout)
+  initDrawingCanvas();
   SCAFFOLDING_AREA.classList.remove('hidden');
   SUMMARY_AREA.classList.remove('hidden');
   FEEDBACK_AREA.classList.add('hidden');
   SCAFFOLD_RESULT.classList.add('hidden');
   SUMMARY_INPUT.value = '';
+  // Load notes for this paragraph
+  loadNote(currentParagraph.id);
 }
 
 // --- Scaffolding ---
 document.getElementById('scafGlossary').addEventListener('click', async function() {
   if (!currentParagraph) return;
-  SCAFFOLD_RESULT.innerHTML = '<em>获取中...</em>';
   SCAFFOLD_RESULT.classList.remove('hidden');
+  SCAFFOLD_CONTENT.innerHTML = '<em>获取中...</em>';
   const data = await api('/api/scaffolding/glossary', {text: currentParagraph.paragraph_text});
-  SCAFFOLD_RESULT.innerHTML = '<strong>[关键词释义]</strong><br>' + data.result.replace(/\n/g, '<br>');
+  SCAFFOLD_CONTENT.innerHTML = '<strong>[关键词释义]</strong>' + md(data.result);
   scaffoldingUsed.push('glossary');
 });
 
-document.getElementById('scafSplit').addEventListener('click', async function() {
+// Split dimension dropdown
+let splitRequestId = 0;
+SPLIT_DIMENSION.addEventListener('change', async function() {
   if (!currentParagraph) return;
-  SCAFFOLD_RESULT.innerHTML = '<em>拆分中...</em>';
-  SCAFFOLD_RESULT.classList.remove('hidden');
-  const data = await api('/api/scaffolding/split', {text: currentParagraph.paragraph_text});
-  SCAFFOLD_RESULT.innerHTML = '<strong>[长句拆分]</strong><br>' + data.result.replace(/\n/g, '<br>');
-  scaffoldingUsed.push('splitting');
+  const dim = this.value;
+  if (!dim) return; // "无"选项，不执行
+  const reqId = ++splitRequestId;
+  this.disabled = true;
+  const sel = this;
+  const data = await api('/api/scaffolding/split', {
+    text: currentParagraph.paragraph_text,
+    dimension: dim,
+  });
+  sel.disabled = false;
+  if (reqId !== splitRequestId) return; // stale response, discard
+  if (data.result) {
+    // HTML-escape then mark delimiters bold
+    const escaped = data.result
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/ \/\//g, ' <strong>//</strong>')
+      .replace(/ \//g, ' <strong>/</strong>');
+    PASSAGE_TEXT.innerHTML = escaped;
+    RESTORE_BTN.classList.remove('hidden');
+    scaffoldingUsed.push('split-' + dim);
+  }
+});
+
+// Restore original text
+RESTORE_BTN.addEventListener('click', function() {
+  if (originalPassageText === null) return;
+  PASSAGE_TEXT.textContent = originalPassageText;
+  this.classList.add('hidden');
+  SPLIT_DIMENSION.value = '';
 });
 
 document.getElementById('scafContext').addEventListener('click', async function() {
   if (!currentParagraph) return;
-  SCAFFOLD_RESULT.innerHTML = '<em>获取中...</em>';
   SCAFFOLD_RESULT.classList.remove('hidden');
+  SCAFFOLD_CONTENT.innerHTML = '<em>获取中...</em>';
   const data = await api('/api/scaffolding/context', {
     text: currentParagraph.paragraph_text,
     item: currentParagraph
   });
-  SCAFFOLD_RESULT.innerHTML = '<strong>[上下文提示]</strong><br>' + data.result.replace(/\n/g, '<br>');
+  SCAFFOLD_CONTENT.innerHTML = '<strong>[上下文提示]</strong>' + md(data.result);
   scaffoldingUsed.push('context');
+});
+
+// Scaffold result close button
+document.getElementById('scaffoldClose').addEventListener('click', function() {
+  SCAFFOLD_RESULT.classList.add('hidden');
 });
 
 // --- Submit summary ---
@@ -242,25 +334,140 @@ SUBMIT_BTN.addEventListener('click', async function() {
     return;
   }
 
-  FEEDBACK_CONTENT.innerHTML = data.result.replace(/\n/g, '<br>');
+  FEEDBACK_CONTENT.innerHTML = md(data.result);
   loadStats();
 });
 
+// --- Note functions ---
+
+let _noteLoaded = false;
+
+async function loadNote(passageId) {
+  if (!passageId) {
+    NOTE_BODY.classList.add('hidden');
+    NOTE_PANEL.classList.add('hidden');
+    return;
+  }
+  NOTE_PANEL.classList.remove('hidden');
+  _noteLoaded = false;
+  const data = await api('/api/notes/' + encodeURIComponent(passageId));
+  NOTE_INPUT.value = data.text || '';
+  NOTE_STATUS.textContent = '';
+  if (data.text) {
+    NOTE_TOGGLE.textContent = '笔记（有内容）';
+  } else {
+    NOTE_TOGGLE.textContent = '笔记';
+  }
+  NOTE_BODY.classList.add('hidden');
+  _noteLoaded = true;
+}
+
+NOTE_TOGGLE.addEventListener('click', function() {
+  NOTE_BODY.classList.toggle('hidden');
+});
+
+NOTE_SAVE_BTN.addEventListener('click', async function() {
+  if (!currentParagraph || !currentParagraph.id) return;
+  NOTE_STATUS.textContent = '保存中...';
+  await api('/api/notes/' + encodeURIComponent(currentParagraph.id), {text: NOTE_INPUT.value});
+  NOTE_STATUS.textContent = '已保存';
+  setTimeout(function() { NOTE_STATUS.textContent = ''; }, 2000);
+  if (NOTE_INPUT.value.trim()) {
+    NOTE_TOGGLE.textContent = '笔记（有内容）';
+  } else {
+    NOTE_TOGGLE.textContent = '笔记';
+  }
+});
+
 // --- History modal ---
+let historyData = null;
 HISTORY_BTN.addEventListener('click', async function() {
-  const data = await api('/api/history');
-  if (!data.length) {
+  historyData = await api('/api/history');
+  if (!historyData.length) {
     HISTORY_LIST.innerHTML = '<p class="empty">暂无练习记录。</p>';
   } else {
     let html = '';
-    for (const entry of data.slice().reverse()) {
+    // Build reversed list for display, store original index
+    for (let i = historyData.length - 1; i >= 0; i--) {
+      const entry = historyData[i];
       html += `<div class="history-entry">
         <div class="h-meta">${entry.datetime} | ${entry.type} | ${entry.title || entry.passage_id}</div>
         <div class="h-summary"><strong>我的总结:</strong> ${entry.my_summary}</div>
-        <div class="h-feedback">${entry.ai_feedback.replace(/\n/g, '<br>')}</div>
+        <div class="h-feedback">${md(entry.ai_feedback)}</div>
+        <button class="restore-history-btn" data-hindex="${i}">恢复</button>
       </div>`;
     }
     HISTORY_LIST.innerHTML = html;
+    // Bind restore buttons
+    HISTORY_LIST.querySelectorAll('.restore-history-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const idx = parseInt(this.dataset.hindex);
+        const entry = historyData[idx];
+        if (!entry) return;
+        // Close modal
+        HISTORY_MODAL.classList.add('hidden');
+        // Clear canvas
+        clearDrawing();
+
+        async function resolveParagraph() {
+          if (entry.paragraph_text) {
+            return entry;
+          }
+          if (entry.passage_id) {
+            const p = await api('/api/paragraph/' + encodeURIComponent(entry.passage_id));
+            if (p && p.paragraph_text) return p;
+          }
+          return null;
+        }
+
+        resolveParagraph().then(function(resolved) {
+          const text = resolved ? resolved.paragraph_text : '';
+          const ctx = resolved ? (resolved.previous_context || entry.previous_context || '') : '';
+
+          if (!text) {
+            PASSAGE_TEXT.textContent = '(段落原文不可用)';
+          } else {
+            PASSAGE_TEXT.textContent = text;
+          }
+          originalPassageText = text || '';
+
+          // Construct minimal currentParagraph
+          currentParagraph = {
+            paragraph_text: text || '',
+            previous_context: ctx,
+            type: entry.type || '',
+            source: entry.source || '',
+            title: entry.title || '',
+            id: entry.passage_id || '',
+            passage_index: 1,
+            total_paragraphs: 1,
+          };
+          scaffoldingUsed = [];
+
+          // Show UI
+          PARAGRAPH_AREA.classList.remove('hidden');
+          SCAFFOLDING_AREA.classList.remove('hidden');
+          SUMMARY_AREA.classList.remove('hidden');
+          FEEDBACK_AREA.classList.remove('hidden');
+          SCAFFOLD_RESULT.classList.add('hidden');
+          RESTORE_BTN.classList.add('hidden');
+          SPLIT_DIMENSION.value = '';
+          // Restore summary and feedback
+          SUMMARY_INPUT.value = entry.my_summary || '';
+          FEEDBACK_CONTENT.innerHTML = md(entry.ai_feedback || '');
+          // Reset meta/context display
+          META_LINE.innerHTML = (entry.type || '') + '  ' + (entry.title || '') + ' &nbsp;|&nbsp; ' + (entry.source || '');
+          if (entry.paragraph_index) {
+            META_LINE.innerHTML += ' &nbsp;|&nbsp; 段落 ' + entry.paragraph_index;
+          }
+          CONTEXT_LINE.classList.add('hidden');
+          // Init canvas overlay
+          setTimeout(initDrawingCanvas, 50);
+          // Load notes for this paragraph
+          if (entry.passage_id) loadNote(entry.passage_id);
+        });
+      });
+    });
   }
   HISTORY_MODAL.classList.remove('hidden');
 });
@@ -270,6 +477,164 @@ CLOSE_MODAL.addEventListener('click', function() {
 });
 window.addEventListener('click', function(e) {
   if (e.target === HISTORY_MODAL) HISTORY_MODAL.classList.add('hidden');
+});
+
+// --- Canvas drawing module ---
+
+function getCanvasPoint(canvas, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+
+function resizeCanvas() {
+  if (!drawCanvas || !drawCtx) return;
+  const container = drawCanvas.parentElement;
+  if (!container) return;
+  const rect = container.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvasW = rect.width;
+  canvasH = rect.height;
+  drawCanvas.width = canvasW * dpr;
+  drawCanvas.height = canvasH * dpr;
+  drawCanvas.style.width = canvasW + 'px';
+  drawCanvas.style.height = canvasH + 'px';
+  drawCtx.scale(dpr, dpr);
+  drawCtx.strokeStyle = '#e74c3c';
+  drawCtx.lineWidth = 3;
+  drawCtx.lineCap = 'round';
+  drawCtx.lineJoin = 'round';
+  redrawAllStrokes();
+}
+
+function redrawAllStrokes() {
+  if (!drawCtx) return;
+  drawCtx.clearRect(0, 0, canvasW, canvasH);
+  drawCtx.strokeStyle = '#e74c3c';
+  drawCtx.lineWidth = 3;
+  drawCtx.lineCap = 'round';
+  drawCtx.lineJoin = 'round';
+  for (const stroke of strokes) {
+    if (stroke.length < 2) continue;
+    drawCtx.beginPath();
+    drawCtx.moveTo(stroke[0].x, stroke[0].y);
+    for (let i = 1; i < stroke.length; i++) {
+      drawCtx.lineTo(stroke[i].x, stroke[i].y);
+    }
+    drawCtx.stroke();
+  }
+}
+
+// Mouse drawing
+function onDrawMouseDown(e) {
+  if (!isDrawMode) return;
+  e.preventDefault();
+  const pt = getCanvasPoint(drawCanvas, e.clientX, e.clientY);
+  isDrawing = true;
+  strokes.push([pt]);
+}
+
+function onDrawMouseMove(e) {
+  if (!isDrawMode || !isDrawing) return;
+  e.preventDefault();
+  const pt = getCanvasPoint(drawCanvas, e.clientX, e.clientY);
+  const stroke = strokes[strokes.length - 1];
+  const prev = stroke[stroke.length - 1];
+  stroke.push(pt);
+  drawCtx.beginPath();
+  drawCtx.moveTo(prev.x, prev.y);
+  drawCtx.lineTo(pt.x, pt.y);
+  drawCtx.stroke();
+}
+
+function onDrawMouseUp() { isDrawing = false; }
+
+// Touch drawing
+function onDrawTouchStart(e) {
+  if (!isDrawMode) return;
+  e.preventDefault();
+  const touch = e.touches[0];
+  const pt = getCanvasPoint(drawCanvas, touch.clientX, touch.clientY);
+  isDrawing = true;
+  strokes.push([pt]);
+}
+
+function onDrawTouchMove(e) {
+  if (!isDrawMode || !isDrawing) return;
+  e.preventDefault();
+  const touch = e.touches[0];
+  const pt = getCanvasPoint(drawCanvas, touch.clientX, touch.clientY);
+  const stroke = strokes[strokes.length - 1];
+  const prev = stroke[stroke.length - 1];
+  stroke.push(pt);
+  drawCtx.beginPath();
+  drawCtx.moveTo(prev.x, prev.y);
+  drawCtx.lineTo(pt.x, pt.y);
+  drawCtx.stroke();
+}
+
+function onDrawTouchEnd() { isDrawing = false; }
+
+function destroyDrawingCanvas() {
+  if (drawResizeObserver) {
+    drawResizeObserver.disconnect();
+    drawResizeObserver = null;
+  }
+  if (drawCanvas) {
+    drawCanvas.remove();
+    drawCanvas = null;
+    drawCtx = null;
+  }
+}
+
+function initDrawingCanvas() {
+  destroyDrawingCanvas();
+  const container = document.querySelector('.passage-container');
+  if (!container) return;
+  drawCanvas = document.createElement('canvas');
+  drawCanvas.id = 'drawCanvas';
+  container.appendChild(drawCanvas);
+  drawCtx = drawCanvas.getContext('2d');
+  resizeCanvas();
+  drawResizeObserver = new ResizeObserver(function() {
+    resizeCanvas();
+  });
+  drawResizeObserver.observe(container);
+  drawCanvas.addEventListener('mousedown', onDrawMouseDown);
+  drawCanvas.addEventListener('mousemove', onDrawMouseMove);
+  drawCanvas.addEventListener('mouseup', onDrawMouseUp);
+  drawCanvas.addEventListener('mouseleave', onDrawMouseUp);
+  drawCanvas.addEventListener('touchstart', onDrawTouchStart, { passive: false });
+  drawCanvas.addEventListener('touchmove', onDrawTouchMove, { passive: false });
+  drawCanvas.addEventListener('touchend', onDrawTouchEnd);
+  drawCanvas.style.pointerEvents = isDrawMode ? 'auto' : 'none';
+  drawCanvas.style.cursor = isDrawMode ? 'crosshair' : '';
+}
+
+function clearDrawing() {
+  isDrawMode = false;
+  isDrawing = false;
+  strokes = [];
+  PEN_BTN.classList.remove('active');
+  destroyDrawingCanvas();
+}
+
+// Pen tool toggle
+PEN_BTN.addEventListener('click', function() {
+  if (!drawCanvas) return;
+  isDrawMode = !isDrawMode;
+  drawCanvas.style.pointerEvents = isDrawMode ? 'auto' : 'none';
+  drawCanvas.style.cursor = isDrawMode ? 'crosshair' : '';
+  this.classList.toggle('active', isDrawMode);
+});
+
+// Ctrl+Z undo
+window.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'z' && isDrawMode) {
+    e.preventDefault();
+    if (strokes.length === 0) return;
+    strokes.pop();
+    redrawAllStrokes();
+  }
 });
 
 // --- Event bindings ---

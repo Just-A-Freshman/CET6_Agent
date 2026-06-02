@@ -11,10 +11,13 @@ from flask import Flask, request, jsonify, render_template
 from openai import OpenAI
 from dotenv import load_dotenv
 
-load_dotenv(r'../.env')
+# Use absolute path for root to avoid working directory issues
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
-DB_PATH = r'../知识库/六级阅读段落库.json'
-HISTORY_PATH = r'../知识库/六级阅读练习记录.json'
+DB_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
+HISTORY_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读练习记录.json')
+NOTES_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读笔记.json')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
 MODEL = 'deepseek-chat'
@@ -64,6 +67,21 @@ def get_practiced_ids():
     return {entry.get('passage_id', '') for entry in h}
 
 
+def load_notes():
+    if os.path.exists(NOTES_PATH):
+        try:
+            with open(NOTES_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+    return {}
+
+
+def save_notes(notes):
+    with open(NOTES_PATH, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(notes, ensure_ascii=True, indent=2))
+
+
 def safe_llm_call(messages, **kwargs):
     def _deep_clean(obj):
         if isinstance(obj, str):
@@ -76,7 +94,10 @@ def safe_llm_call(messages, **kwargs):
     messages = _deep_clean(messages)
     resp = client.chat.completions.create(model=MODEL, messages=messages, **kwargs)
     if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
-        resp.choices[0].message.content = clean_text(resp.choices[0].message.content)
+        content = resp.choices[0].message.content
+        # Only remove surrogate characters, preserve all whitespace including newlines
+        content = ''.join(c if ord(c) < 0xD800 or ord(c) > 0xDFFF else ' ' for c in content)
+        resp.choices[0].message.content = content.strip()
     return resp
 
 
@@ -97,31 +118,63 @@ def scaffolding_glossary(text):
     return resp.choices[0].message.content or ''
 
 
-def scaffolding_split(text):
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    result = []
-    for sent in sentences:
-        words = sent.split()
-        if len(words) > 15:
-            sent = re.sub(
-                r'\b(which|that|because|although|while|whereas|if|when|since|unless|until'
-                r'|as\s+(?:long\s+as|soon\s+as|far\s+as))\b',
-                lambda m: f' / {m.group(1)}', sent, flags=re.IGNORECASE)
-            sent = re.sub(
-                r'\b(and|but|or|so|yet|however|therefore|moreover|furthermore|nevertheless)\b',
-                lambda m: f' / {m.group(1)}', sent, flags=re.IGNORECASE)
-            sent = re.sub(
-                r'\b(who|whom|whose|where|when)\b',
-                lambda m: f' / {m.group(1)}', sent, flags=re.IGNORECASE)
-        result.append(sent)
-    return '\n'.join(result)
+def scaffolding_split(text, dimension='sense-group'):
+    prompts = {
+        'constituent': (
+            '你是一名英语六级阅读辅导老师。下面是一个英文段落。'
+            '请按句子语法成分拆分成更小的结构单元。具体来说，识别并拆分以下成分：\n'
+            '- 主语部分 / 谓语部分\n'
+            '- 定语从句及其修饰的名词\n'
+            '- 状语从句 / 介词短语作状语\n'
+            '- 宾语从句 / 表语从句\n'
+            '- 同位语\n'
+            '- 不定式短语 / 分词短语\n\n'
+            '示例：\n'
+            '原文：The study / conducted by researchers / shows that regular exercise / can significantly improve mental health.\n'
+            '（按成分拆分：主语部分 / 定语修饰 / 谓语+宾语从句 / 从句内谓语+宾语）\n\n'
+            '规则：\n'
+            '- 用一个空格 + "/" + 一个空格 作为分隔符\n'
+            '- 不改变原文任何单词\n'
+            '- 不添加任何解释或额外文字\n'
+            '- 在标点符号处不要盲目切分，要考虑前面的词是否和标点后的词属于同一语法成分\n'
+            '- 如果段落很短（不足8个词），直接返回原文不加分隔符\n\n'
+            f'段落：\n{text}'
+        ),
+        'sense-group': (
+            '你是一名英语六级阅读辅导老师。下面是一个英文段落。'
+            '请按意群（能表达完整意义的最小单元）拆分成更小的结构单元。\n\n'
+            '规则：\n'
+            '- 用一个空格 + "/" + 一个空格 作为分隔符\n'
+            '- 不改变原文任何单词\n'
+            '- 不添加任何解释或额外文字\n'
+            '- 如果段落很短（不足8个词），直接返回原文不加分隔符\n\n'
+            f'段落：\n{text}'
+        ),
+        'content': (
+            '你是一名英语六级阅读辅导老师。下面是一个英文段落。'
+            '请按段落内核心观点进行切分，把表达不同观点的部分分开，但不拆散完整句子。\n\n'
+            '规则：\n'
+            '- 用两个空格 + "//" + 两个空格 作为段落内不同观点之间的分隔符\n'
+            '- 不改变原文任何单词\n'
+            '- 不添加任何解释或额外文字\n'
+            '- 如果段落只有一个核心观点，直接返回原文不加分隔符\n\n'
+            f'段落：\n{text}'
+        ),
+    }
+    prompt = prompts.get(dimension, prompts['sense-group'])
+    resp = safe_llm_call(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0, max_tokens=2000,
+    )
+    return resp.choices[0].message.content or text
 
 
 def scaffolding_context(text, item):
     ctx = item.get('previous_context', '')
     prompt = (
-        f'你是一名英语六级阅读辅导老师。学生将阅读以下段落并尝试用中文总结。\n'
-        f'请提供一些有助于理解段落内容的背景提示或上下文信息（用中文，2-3句）。\n\n'
+        f'你是一名英语六级阅读辅导老师。学生即将阅读下面的英文段落。\n'
+        f'请提供一些有助于理解该段落内容的背景知识或上下文信息（用中文，2-3句）。\n'
+        f'注意：不要总结段落本身的内容，只需提供阅读它所需的背景信息。\n\n'
         f'文章标题: {item.get("title", "")}\n'
         f'来源: {item["source"]}\n'
         f'上文总结: {ctx if ctx else "(暂无)"}\n\n'
@@ -204,6 +257,43 @@ def api_random_paragraph():
     })
 
 
+@app.route('/api/paragraph/<passage_id>')
+def api_paragraph(passage_id):
+    for p in ALL_PARAGRAPHS:
+        if p['id'] == passage_id:
+            return jsonify({
+                'id': p['id'],
+                'type': p['type'],
+                'title': p.get('title', ''),
+                'source': p['source'],
+                'passage_index': p['passage_index'],
+                'paragraph_index': p['paragraph_index'],
+                'total_paragraphs': p['total_paragraphs'],
+                'paragraph_text': p['paragraph_text'],
+                'previous_context': p.get('previous_context', ''),
+            })
+    return jsonify({'error': 'Paragraph not found'}), 404
+
+
+@app.route('/api/notes/<passage_id>')
+def api_get_note(passage_id):
+    notes = load_notes()
+    return jsonify({'text': notes.get(passage_id, '')})
+
+
+@app.route('/api/notes/<passage_id>', methods=['POST'])
+def api_save_note(passage_id):
+    data = request.get_json()
+    text = (data.get('text', '') or '').strip()
+    notes = load_notes()
+    if text:
+        notes[passage_id] = text
+    else:
+        notes.pop(passage_id, None)
+    save_notes(notes)
+    return jsonify({'ok': True})
+
+
 @app.route('/api/scaffolding/glossary', methods=['POST'])
 def api_glossary():
     data = request.get_json()
@@ -216,7 +306,8 @@ def api_glossary():
 def api_split():
     data = request.get_json()
     text = data.get('text', '')
-    result = scaffolding_split(text)
+    dimension = data.get('dimension', 'sense-group')
+    result = scaffolding_split(text, dimension)
     return jsonify({'result': result})
 
 
@@ -250,6 +341,8 @@ def api_feedback():
         'scaffolding_used': data.get('scaffolding_used', []),
         'my_summary': summary,
         'ai_feedback': result,
+        'paragraph_text': text,
+        'previous_context': context,
     })
     save_history(history)
     return jsonify({'result': result})
