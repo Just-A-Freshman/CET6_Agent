@@ -5,3 +5,9 @@ This is a series of learning agents designed to help you pass the CET-6.
 # Coze
 六级翻译学习：https://www.coze.cn/store/agent/7641143120905814068
 
+六级阅读学习：
+```
+cd ./reading/code
+reading_web.py
+```
+随后点击：http://127.0.0.1:5000
