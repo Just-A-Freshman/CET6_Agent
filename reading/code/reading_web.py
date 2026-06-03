@@ -4,8 +4,8 @@ Web interface for CET-6 Reading Paragraph Summary Practice.
 import os
 import re
 import json
-import random
 import sys
+import sqlite3
 sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 from flask import Flask, request, jsonify, render_template
 from openai import OpenAI
@@ -15,10 +15,7 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
-DB_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
-HISTORY_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读练习记录.json')
-DIALOG_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读对话记录.json')
-NOTES_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读笔记.json')
+SQLITE_PATH = os.path.join(_PROJECT_ROOT, '知识库/reading.db')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
 MODEL = 'deepseek-chat'
@@ -27,7 +24,13 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
 
-# --- Data loading (same as CLI version) ---
+# --- Database helpers ---
+
+def get_db():
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def clean_text(text):
     if not text:
@@ -37,65 +40,142 @@ def clean_text(text):
     return text
 
 
-with open(DB_PATH, 'r', encoding='utf-8') as f:
-    raw_json = f.read()
-raw_json = re.sub(r'\\u[dD][89a-fA-F][0-9a-fA-F]{2}', ' ', raw_json)
-raw_json = re.sub(r'\\u[dD][cC][0-9a-fA-f]{2}', ' ', raw_json)
-ALL_PARAGRAPHS = json.loads(raw_json)
-
-for p in ALL_PARAGRAPHS:
-    p['paragraph_text'] = clean_text(p.get('paragraph_text', ''))
-    p['previous_context'] = clean_text(p.get('previous_context', ''))
+def row_to_dict(row):
+    if row is None:
+        return None
+    return dict(row)
 
 
-def load_history():
-    if os.path.exists(HISTORY_PATH):
+def get_practiced_ids():
+    conn = get_db()
+    rows = conn.execute("SELECT DISTINCT passage_id FROM history WHERE passage_id != ''").fetchall()
+    conn.close()
+    return {r['passage_id'] for r in rows}
+
+
+def get_stats():
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM paragraphs").fetchone()[0]
+    practiced_ids = get_practiced_ids()
+    practiced = len(practiced_ids)
+    by_type = {}
+    for t in ['选词填空', '长篇阅读', '仔细阅读']:
+        row = conn.execute("SELECT COUNT(*) FROM paragraphs WHERE type=?", (t,)).fetchone()
+        total_t = row[0]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM paragraphs WHERE type=? AND id NOT IN (SELECT passage_id FROM history WHERE passage_id != '')",
+            (t,)
+        ).fetchone()[0]
+        by_type[t] = {'total': total_t, 'remaining': remaining}
+    conn.close()
+    return {'total': total, 'practiced': practiced, 'by_type': by_type}
+
+
+def get_random_paragraph(ptype):
+    conn = get_db()
+    practiced = get_practiced_ids()
+    if practiced:
+        cur = conn.execute(
+            "SELECT * FROM paragraphs WHERE type=? AND id NOT IN (SELECT passage_id FROM history WHERE passage_id != '') ORDER BY RANDOM() LIMIT 1",
+            (ptype,)
+        )
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return row_to_dict(row)
+    # Fallback: any paragraph of this type
+    cur = conn.execute("SELECT * FROM paragraphs WHERE type=? ORDER BY RANDOM() LIMIT 1", (ptype,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+
+def get_paragraph(passage_id):
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM paragraphs WHERE id=?", (passage_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+
+def get_note(passage_id):
+    conn = get_db()
+    cur = conn.execute("SELECT text FROM notes WHERE passage_id=?", (passage_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row['text'] if row else ''
+
+
+def save_note(passage_id, text):
+    conn = get_db()
+    if text:
+        conn.execute(
+            "INSERT INTO notes (passage_id, text) VALUES (?, ?) ON CONFLICT(passage_id) DO UPDATE SET text=?",
+            (passage_id, text, text)
+        )
+    else:
+        conn.execute("DELETE FROM notes WHERE passage_id=?", (passage_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_dialog(passage_id):
+    conn = get_db()
+    cur = conn.execute("SELECT messages FROM dialogues WHERE passage_id=?", (passage_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
         try:
-            with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            return json.loads(row['messages'])
+        except (json.JSONDecodeError, TypeError):
             return []
     return []
 
 
-def save_history(history):
-    with open(HISTORY_PATH, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(history, ensure_ascii=True, indent=2))
+def save_dialog(passage_id, messages):
+    conn = get_db()
+    if messages:
+        conn.execute(
+            "INSERT INTO dialogues (passage_id, messages) VALUES (?, ?) ON CONFLICT(passage_id) DO UPDATE SET messages=?",
+            (passage_id, json.dumps(messages, ensure_ascii=False), json.dumps(messages, ensure_ascii=False))
+        )
+    else:
+        conn.execute("DELETE FROM dialogues WHERE passage_id=?", (passage_id,))
+    conn.commit()
+    conn.close()
 
 
-def get_practiced_ids():
-    h = load_history()
-    return {entry.get('passage_id', '') for entry in h}
+def get_history():
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT h.*, GROUP_CONCAT(s.tool_name, ',') as tool_names
+        FROM history h
+        LEFT JOIN scaffolds s ON s.history_id = h.id
+        GROUP BY h.id
+        ORDER BY h.datetime DESC
+    """).fetchall()
+    result = []
+    for r in rows:
+        entry = dict(r)
+        tools = r['tool_names'].split(',') if r['tool_names'] else []
+        entry['scaffolding_used'] = [t for t in tools if t]
+        del entry['tool_names']
+        result.append(entry)
+    conn.close()
+    return result
 
 
-def load_notes():
-    if os.path.exists(NOTES_PATH):
-        try:
-            with open(NOTES_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-    return {}
-
-
-def save_notes(notes):
-    with open(NOTES_PATH, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(notes, ensure_ascii=True, indent=2))
-
-
-def load_dialogs():
-    if os.path.exists(DIALOG_PATH):
-        try:
-            with open(DIALOG_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-    return {}
-
-
-def save_dialogs(dialogs):
-    with open(DIALOG_PATH, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(dialogs, ensure_ascii=True, indent=2))
+def save_history_entry(datetime, passage_id, ptype, source, title, paragraph_index, summary, feedback, scaffolding_used):
+    conn = get_db()
+    cur = conn.execute("""
+        INSERT INTO history (datetime, passage_id, type, source, title, paragraph_index, my_summary, ai_feedback)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (datetime, passage_id, ptype, source, title, paragraph_index, summary, feedback))
+    hid = cur.lastrowid
+    for tool in (scaffolding_used or []):
+        conn.execute("INSERT INTO scaffolds (history_id, tool_name) VALUES (?, ?)", (hid, tool))
+    conn.commit()
+    conn.close()
 
 
 def safe_llm_call(messages, **kwargs):
@@ -219,22 +299,18 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 
-def save_summary_to_history(paragraph_id, ptype, source, title, paragraph_index, summary, text, context):
-    history = load_history()
-    history.append({
-        'datetime': __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'passage_id': paragraph_id,
-        'type': ptype,
-        'source': source,
-        'title': title,
-        'paragraph_index': paragraph_index,
-        'scaffolding_used': [],
-        'my_summary': summary,
-        'ai_feedback': '',
-        'paragraph_text': text,
-        'previous_context': context,
-    })
-    save_history(history)
+def save_summary_to_history(paragraph_id, ptype, source, title, paragraph_index, summary):
+    save_history_entry(
+        datetime=__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
+        passage_id=paragraph_id,
+        ptype=ptype,
+        source=source,
+        title=title,
+        paragraph_index=paragraph_index,
+        summary=summary,
+        feedback='',
+        scaffolding_used=[],
+    )
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -307,20 +383,15 @@ def api_chat():
 
 @app.route('/api/dialogs/<passage_id>')
 def api_get_dialog(passage_id):
-    dialogs = load_dialogs()
-    return jsonify({'messages': dialogs.get(passage_id, [])})
+    messages = get_dialog(passage_id)
+    return jsonify({'messages': messages})
 
 
 @app.route('/api/dialogs/<passage_id>', methods=['POST'])
 def api_save_dialog(passage_id):
     data = request.get_json()
     messages = data.get('messages', [])
-    dialogs = load_dialogs()
-    if messages:
-        dialogs[passage_id] = messages
-    else:
-        dialogs.pop(passage_id, None)
-    save_dialogs(dialogs)
+    save_dialog(passage_id, messages)
     return jsonify({'ok': True})
 
 
@@ -333,73 +404,38 @@ def index():
 
 @app.route('/api/stats')
 def api_stats():
-    practiced = get_practiced_ids()
-    stats = {'total': len(ALL_PARAGRAPHS), 'practiced': len(practiced), 'by_type': {}}
-    for t in ['选词填空', '长篇阅读', '仔细阅读']:
-        total = sum(1 for p in ALL_PARAGRAPHS if p['type'] == t)
-        remaining = sum(1 for p in ALL_PARAGRAPHS if p['type'] == t and p['id'] not in practiced)
-        stats['by_type'][t] = {'total': total, 'remaining': remaining}
-    return jsonify(stats)
+    return jsonify(get_stats())
 
 
 @app.route('/api/random_paragraph', methods=['POST'])
 def api_random_paragraph():
     data = request.get_json()
     ptype = data.get('type', '仔细阅读')
-    practiced = get_practiced_ids()
-    candidates = [p for p in ALL_PARAGRAPHS if p['type'] == ptype and p['id'] not in practiced]
-    if not candidates:
-        candidates = [p for p in ALL_PARAGRAPHS if p['type'] == ptype]
-    if not candidates:
+    item = get_random_paragraph(ptype)
+    if not item:
         return jsonify({'error': 'No paragraphs found for this type'}), 404
-    item = random.choice(candidates)
-    return jsonify({
-        'id': item['id'],
-        'type': item['type'],
-        'title': item.get('title', ''),
-        'source': item['source'],
-        'passage_index': item['passage_index'],
-        'paragraph_index': item['paragraph_index'],
-        'total_paragraphs': item['total_paragraphs'],
-        'paragraph_text': item['paragraph_text'],
-        'previous_context': item.get('previous_context', ''),
-    })
+    return jsonify(item)
 
 
 @app.route('/api/paragraph/<passage_id>')
 def api_paragraph(passage_id):
-    for p in ALL_PARAGRAPHS:
-        if p['id'] == passage_id:
-            return jsonify({
-                'id': p['id'],
-                'type': p['type'],
-                'title': p.get('title', ''),
-                'source': p['source'],
-                'passage_index': p['passage_index'],
-                'paragraph_index': p['paragraph_index'],
-                'total_paragraphs': p['total_paragraphs'],
-                'paragraph_text': p['paragraph_text'],
-                'previous_context': p.get('previous_context', ''),
-            })
-    return jsonify({'error': 'Paragraph not found'}), 404
+    item = get_paragraph(passage_id)
+    if not item:
+        return jsonify({'error': 'Paragraph not found'}), 404
+    return jsonify(item)
 
 
 @app.route('/api/notes/<passage_id>')
 def api_get_note(passage_id):
-    notes = load_notes()
-    return jsonify({'text': notes.get(passage_id, '')})
+    text = get_note(passage_id)
+    return jsonify({'text': text})
 
 
 @app.route('/api/notes/<passage_id>', methods=['POST'])
 def api_save_note(passage_id):
     data = request.get_json()
     text = (data.get('text', '') or '').strip()
-    notes = load_notes()
-    if text:
-        notes[passage_id] = text
-    else:
-        notes.pop(passage_id, None)
-    save_notes(notes)
+    save_note(passage_id, text)
     return jsonify({'ok': True})
 
 
@@ -431,8 +467,7 @@ def api_context():
 
 @app.route('/api/history')
 def api_history():
-    history = load_history()
-    return jsonify(history)
+    return jsonify(get_history())
 
 
 if __name__ == '__main__':
