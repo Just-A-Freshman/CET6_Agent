@@ -352,14 +352,14 @@ def api_chat():
                 yield f'data: {json.dumps({"content": content})}\n\n'
 
         # After streaming completes, check for summary marker
-        import re
-        marker = f'<CET6_SUMMARY>'
-        end_marker = f'</CET6_SUMMARY>'
-        if marker in full_response:
+        if '<CET6_SUMMARY>' in full_response:
             try:
-                start = full_response.index(marker) + len(marker)
-                end = full_response.index(end_marker, start)
+                start = full_response.index('<CET6_SUMMARY>') + len('<CET6_SUMMARY>')
+                end = full_response.index('</CET6_SUMMARY>', start)
                 summary_json = full_response[start:end].strip()
+                # Strip markdown code fences if LLM wrapped the JSON
+                summary_json = re.sub(r'^```(?:json)?\s*', '', summary_json)
+                summary_json = re.sub(r'\s*```$', '', summary_json)
                 info = json.loads(summary_json)
                 if info.get('is_summary'):
                     save_summary_to_history(
@@ -369,12 +369,10 @@ def api_chat():
                         title=title,
                         paragraph_index=paragraph_index,
                         summary=info.get('summary_text', ''),
-                        text=paragraph_text,
-                        context=previous_context,
                     )
                     yield f'data: {json.dumps({"summary_saved": True})}\n\n'
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[chat] summary parse error: {e}", file=__import__('sys').stderr)
 
         yield 'data: [DONE]\n\n'
 
