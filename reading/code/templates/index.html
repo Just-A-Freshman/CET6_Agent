@@ -71,17 +71,13 @@
     </div>
   </div>
 
-  <!-- Summary input -->
-  <div id="summaryArea" class="hidden">
-    <label for="summaryInput">你的中文总结（50字以内）:</label>
-    <textarea id="summaryInput" rows="3" placeholder="请用中文简要总结本段的大意..."></textarea>
-    <button id="submitBtn">提交反馈</button>
-  </div>
-
-  <!-- Feedback -->
-  <div id="feedbackArea" class="hidden">
-    <h3>AI反馈</h3>
-    <div id="feedbackContent"></div>
+  <!-- Chat area (AI tutor) -->
+  <div id="chatArea" class="hidden">
+    <div id="chatMessages" class="chat-messages"></div>
+    <div class="chat-input-row">
+      <textarea id="chatInput" rows="2" placeholder="输入你的总结、提问..."></textarea>
+      <button id="chatSendBtn">发送</button>
+    </div>
   </div>
 
   <!-- History modal -->
@@ -122,11 +118,10 @@ const NOTE_BODY = document.getElementById('noteBody');
 const NOTE_INPUT = document.getElementById('noteInput');
 const NOTE_SAVE_BTN = document.getElementById('noteSaveBtn');
 const NOTE_STATUS = document.getElementById('noteStatus');
-const SUMMARY_AREA = document.getElementById('summaryArea');
-const SUMMARY_INPUT = document.getElementById('summaryInput');
-const SUBMIT_BTN = document.getElementById('submitBtn');
-const FEEDBACK_AREA = document.getElementById('feedbackArea');
-const FEEDBACK_CONTENT = document.getElementById('feedbackContent');
+const CHAT_AREA = document.getElementById('chatArea');
+const CHAT_MESSAGES = document.getElementById('chatMessages');
+const CHAT_INPUT = document.getElementById('chatInput');
+const CHAT_SEND_BTN = document.getElementById('chatSendBtn');
 const LOADING = document.getElementById('loading');
 const HISTORY_MODAL = document.getElementById('historyModal');
 const HISTORY_LIST = document.getElementById('historyList');
@@ -149,6 +144,10 @@ let strokes = [];       // Array<Array<{x, y}>>
 let drawResizeObserver = null;
 let canvasW = 0;        // CSS-pixel width
 let canvasH = 0;        // CSS-pixel height
+
+// --- Chat state ---
+let chatMessages = [];  // Array<{role, content}>
+let chatStreaming = false;
 
 // --- Font control ---
 const savedFont = localStorage.getItem('cet6-font-size') || '18';
@@ -236,12 +235,12 @@ async function drawParagraph() {
   // Init canvas overlay after the paragraph area is visible (needs layout)
   initDrawingCanvas();
   SCAFFOLDING_AREA.classList.remove('hidden');
-  SUMMARY_AREA.classList.remove('hidden');
-  FEEDBACK_AREA.classList.add('hidden');
   SCAFFOLD_RESULT.classList.add('hidden');
-  SUMMARY_INPUT.value = '';
   // Load notes for this paragraph
   loadNote(currentParagraph.id);
+  // Init chat dialog
+  chatMessages = [];
+  loadChatDialog();
 }
 
 // --- Scaffolding ---
@@ -308,34 +307,137 @@ document.getElementById('scaffoldClose').addEventListener('click', function() {
   SCAFFOLD_RESULT.classList.add('hidden');
 });
 
-// --- Submit summary ---
-SUBMIT_BTN.addEventListener('click', async function() {
-  const summary = SUMMARY_INPUT.value.trim();
-  if (!summary) { alert('请先输入你的总结！'); return; }
-  if (!currentParagraph) return;
+// --- Chat (AI tutor) ---
 
-  FEEDBACK_CONTENT.innerHTML = '<em>分析中...</em>';
-  FEEDBACK_AREA.classList.remove('hidden');
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
 
-  const data = await api('/api/feedback', {
-    passage_id: currentParagraph.id,
-    type: currentParagraph.type,
-    source: currentParagraph.source,
-    title: currentParagraph.title,
-    paragraph_index: currentParagraph.paragraph_index,
-    scaffolding_used: scaffoldingUsed,
-    text: currentParagraph.paragraph_text,
-    context: currentParagraph.previous_context,
-    summary: summary,
-  });
+function renderChatMessages(scrollDown) {
+  let html = '';
+  for (let i = 0; i < chatMessages.length; i++) {
+    const msg = chatMessages[i];
+    if (msg.role === 'user') {
+      html += '<div class="chat-msg user"><div class="chat-bubble user-bubble">' + escapeHtml(msg.content) + '</div></div>';
+    } else {
+      const streamingClass = (i === chatMessages.length - 1 && chatStreaming) ? ' streaming' : '';
+      html += '<div class="chat-msg ai' + streamingClass + '"><div class="chat-avatar">AI</div><div class="chat-bubble ai-bubble">'
+        + md(msg.content || '')
+        + '<span class="chat-cursor' + (streamingClass ? '' : ' hidden') + '">▌</span></div></div>';
+    }
+  }
+  CHAT_MESSAGES.innerHTML = html;
+  if (scrollDown !== false) {
+    CHAT_MESSAGES.scrollTop = CHAT_MESSAGES.scrollHeight;
+  }
+}
 
-  if (data.error) {
-    FEEDBACK_CONTENT.innerHTML = '<span class="error">' + data.error + '</span>';
-    return;
+async function sendChatMessage() {
+  const text = CHAT_INPUT.value.trim();
+  if (!text || chatStreaming || !currentParagraph) return;
+  CHAT_INPUT.value = '';
+  chatStreaming = true;
+  CHAT_SEND_BTN.disabled = true;
+
+  chatMessages.push({role: 'user', content: text});
+  const aiIdx = chatMessages.length;
+  chatMessages.push({role: 'assistant', content: ''});
+  renderChatMessages();
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        paragraph_id: currentParagraph.id,
+        paragraph_text: currentParagraph.paragraph_text,
+        previous_context: currentParagraph.previous_context || '',
+        type: currentParagraph.type,
+        source: currentParagraph.source,
+        title: currentParagraph.title,
+        paragraph_index: currentParagraph.paragraph_index,
+        messages: chatMessages.slice(0, -1),
+        user_message: text,
+      }),
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const data = JSON.parse(payload);
+          if (data.content) {
+            chatMessages[aiIdx].content += data.content;
+            const msgEl = CHAT_MESSAGES.querySelector('.chat-msg.ai.streaming');
+            if (msgEl) {
+              msgEl.querySelector('.ai-bubble').innerHTML =
+                md(chatMessages[aiIdx].content) + '<span class="chat-cursor">▌</span>';
+              CHAT_MESSAGES.scrollTop = CHAT_MESSAGES.scrollHeight;
+            }
+          }
+          if (data.summary_saved) {
+            loadStats();
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    chatMessages[aiIdx].content = '（出错了，请重试）';
+    renderChatMessages();
   }
 
-  FEEDBACK_CONTENT.innerHTML = md(data.result);
-  loadStats();
+  chatStreaming = false;
+  CHAT_SEND_BTN.disabled = false;
+  renderChatMessages();
+
+  // Save dialog
+  try {
+    await fetch('/api/dialogs/' + encodeURIComponent(currentParagraph.id), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({messages: chatMessages}),
+    });
+  } catch(e) {}
+}
+
+async function loadChatDialog() {
+  if (!currentParagraph || !currentParagraph.id) return;
+  try {
+    const data = await api('/api/dialogs/' + encodeURIComponent(currentParagraph.id));
+    chatMessages = data.messages || [];
+    if (chatMessages.length === 0) {
+      chatMessages = [
+        {role: 'assistant', content: '你好！请用中文总结本段的大意，或者问我关于文中词句的问题。'}
+      ];
+    }
+  } catch(e) {
+    chatMessages = [
+      {role: 'assistant', content: '你好！请用中文总结本段的大意，或者问我关于文中词句的问题。'}
+    ];
+  }
+  renderChatMessages();
+  CHAT_AREA.classList.remove('hidden');
+}
+
+CHAT_SEND_BTN.addEventListener('click', sendChatMessage);
+CHAT_INPUT.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChatMessage();
+  }
 });
 
 // --- Note functions ---
@@ -447,15 +549,9 @@ HISTORY_BTN.addEventListener('click', async function() {
           // Show UI
           PARAGRAPH_AREA.classList.remove('hidden');
           SCAFFOLDING_AREA.classList.remove('hidden');
-          SUMMARY_AREA.classList.remove('hidden');
-          FEEDBACK_AREA.classList.remove('hidden');
           SCAFFOLD_RESULT.classList.add('hidden');
           RESTORE_BTN.classList.add('hidden');
           SPLIT_DIMENSION.value = '';
-          // Restore summary and feedback
-          SUMMARY_INPUT.value = entry.my_summary || '';
-          FEEDBACK_CONTENT.innerHTML = md(entry.ai_feedback || '');
-          // Reset meta/context display
           META_LINE.innerHTML = (entry.type || '') + '  ' + (entry.title || '') + ' &nbsp;|&nbsp; ' + (entry.source || '');
           if (entry.paragraph_index) {
             META_LINE.innerHTML += ' &nbsp;|&nbsp; 段落 ' + entry.paragraph_index;
@@ -465,6 +561,9 @@ HISTORY_BTN.addEventListener('click', async function() {
           setTimeout(initDrawingCanvas, 50);
           // Load notes for this paragraph
           if (entry.passage_id) loadNote(entry.passage_id);
+          // Init chat dialog
+          chatMessages = [];
+          if (entry.passage_id) loadChatDialog();
         });
       });
     });

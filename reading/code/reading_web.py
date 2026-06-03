@@ -17,6 +17,7 @@ load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
 DB_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
 HISTORY_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读练习记录.json')
+DIALOG_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读对话记录.json')
 NOTES_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读笔记.json')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
@@ -80,6 +81,21 @@ def load_notes():
 def save_notes(notes):
     with open(NOTES_PATH, 'w', encoding='utf-8') as f:
         f.write(json.dumps(notes, ensure_ascii=True, indent=2))
+
+
+def load_dialogs():
+    if os.path.exists(DIALOG_PATH):
+        try:
+            with open(DIALOG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+    return {}
+
+
+def save_dialogs(dialogs):
+    with open(DIALOG_PATH, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(dialogs, ensure_ascii=True, indent=2))
 
 
 def safe_llm_call(messages, **kwargs):
@@ -187,32 +203,125 @@ def scaffolding_context(text, item):
     return resp.choices[0].message.content or ''
 
 
-def get_ai_feedback(text, context, user_summary):
-    prompt = (
-        '你是一名严格的英语六级阅读老师。评价学生用中文写的段落总结。\n\n'
-        '英文段落原文:\n'
-        f'{text}\n\n'
-    )
-    if context:
-        prompt += f'前文背景:\n{context}\n\n'
-    prompt += (
-        f'学生的中文总结:\n{user_summary}\n\n'
-        '请从以下维度评价（用中文，简洁精炼）：\n'
-        '1. 准确性：总结中有没有事实性错误或理解偏差？\n'
-        '2. 完整性：是否覆盖了段落的核心信息？有没有遗漏关键点？\n'
-        '3. 核心观点：是否准确抓住了段落主旨？\n\n'
-        '最后给出一个参考中文总结（50字以内）。\n'
-        '格式：\n'
-        '准确性：xxx\n'
-        '完整性：xxx\n'
-        '核心观点：是/否\n'
-        '参考总结：xxx'
-    )
-    resp = safe_llm_call(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0, max_tokens=2000,
-    )
-    return resp.choices[0].message.content or ''
+# --- Chat / AI tutor ---
+
+CHAT_SYSTEM_PROMPT = (
+    "你是一名英语六级阅读辅导老师。你的核心任务是引导学生用自己的话总结英文段落的大意。\n\n"
+    "当前段落：\n{paragraph_text}\n\n"
+    "前文背景：\n{previous_context}\n\n"
+    "规则：\n"
+    "1. 如果学生用中文给出了段落大意总结，你给出反馈评价后，必须在回复末尾另起一行输出以下标记（不要加任何额外文字在标记之后）：\n"
+    '   <CET6_SUMMARY>{"is_summary": true, "summary_text": "将学生的总结原文放在这里"}</CET6_SUMMARY>\n'
+    "2. 如果学生在问翻译、词义或语法问题，正常回答，不加任何标记\n"
+    "3. 如果学生还没有给出总结，通过追问、提示、引导帮助学生\n"
+    "4. 用中文回复\n\n"
+    "重要：标记 <CET6_SUMMARY> 必须出现在回复的最后一行，前面用换行隔开。"
+)
+
+
+def save_summary_to_history(paragraph_id, ptype, source, title, paragraph_index, summary, text, context):
+    history = load_history()
+    history.append({
+        'datetime': __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'passage_id': paragraph_id,
+        'type': ptype,
+        'source': source,
+        'title': title,
+        'paragraph_index': paragraph_index,
+        'scaffolding_used': [],
+        'my_summary': summary,
+        'ai_feedback': '',
+        'paragraph_text': text,
+        'previous_context': context,
+    })
+    save_history(history)
+
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    data = request.get_json()
+    paragraph_id = data.get('paragraph_id', '')
+    paragraph_text = data.get('paragraph_text', '')
+    previous_context = data.get('previous_context', '')
+    ptype = data.get('type', '')
+    source = data.get('source', '')
+    title = data.get('title', '')
+    paragraph_index = data.get('paragraph_index', 0)
+    messages = data.get('messages', [])
+    user_message = data.get('user_message', '')
+
+    if not user_message.strip():
+        return jsonify({'error': 'Message is required'}), 400
+
+    # Insert system prompt at the beginning
+    sys_prompt = CHAT_SYSTEM_PROMPT.replace('{paragraph_text}', paragraph_text).replace('{previous_context}', previous_context)
+
+    full_messages = [{"role": "system", "content": sys_prompt}]
+    for m in messages:
+        full_messages.append({"role": m["role"], "content": m["content"]})
+
+    def generate():
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=full_messages,
+            stream=True,
+            temperature=0.3,
+            max_tokens=3000,
+        )
+        full_response = ''
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                full_response += content
+                yield f'data: {json.dumps({"content": content})}\n\n'
+
+        # After streaming completes, check for summary marker
+        import re
+        marker = f'<CET6_SUMMARY>'
+        end_marker = f'</CET6_SUMMARY>'
+        if marker in full_response:
+            try:
+                start = full_response.index(marker) + len(marker)
+                end = full_response.index(end_marker, start)
+                summary_json = full_response[start:end].strip()
+                info = json.loads(summary_json)
+                if info.get('is_summary'):
+                    save_summary_to_history(
+                        paragraph_id=paragraph_id,
+                        ptype=ptype,
+                        source=source,
+                        title=title,
+                        paragraph_index=paragraph_index,
+                        summary=info.get('summary_text', ''),
+                        text=paragraph_text,
+                        context=previous_context,
+                    )
+                    yield f'data: {json.dumps({"summary_saved": True})}\n\n'
+            except Exception:
+                pass
+
+        yield 'data: [DONE]\n\n'
+
+    return app.response_class(generate(), mimetype='text/event-stream')
+
+
+@app.route('/api/dialogs/<passage_id>')
+def api_get_dialog(passage_id):
+    dialogs = load_dialogs()
+    return jsonify({'messages': dialogs.get(passage_id, [])})
+
+
+@app.route('/api/dialogs/<passage_id>', methods=['POST'])
+def api_save_dialog(passage_id):
+    data = request.get_json()
+    messages = data.get('messages', [])
+    dialogs = load_dialogs()
+    if messages:
+        dialogs[passage_id] = messages
+    else:
+        dialogs.pop(passage_id, None)
+    save_dialogs(dialogs)
+    return jsonify({'ok': True})
 
 
 # --- Flask routes ---
@@ -317,34 +426,6 @@ def api_context():
     text = clean_text(data.get('text', ''))
     item = data.get('item', {})
     result = scaffolding_context(text, item)
-    return jsonify({'result': result})
-
-
-@app.route('/api/feedback', methods=['POST'])
-def api_feedback():
-    data = request.get_json()
-    text = clean_text(data.get('text', ''))
-    context = clean_text(data.get('context', ''))
-    summary = data.get('summary', '').strip()
-    if not summary:
-        return jsonify({'error': 'Summary is required'}), 400
-    result = get_ai_feedback(text, context, summary)
-    # Save to history
-    history = load_history()
-    history.append({
-        'datetime': __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'passage_id': data.get('passage_id', ''),
-        'type': data.get('type', ''),
-        'source': data.get('source', ''),
-        'title': data.get('title', ''),
-        'paragraph_index': data.get('paragraph_index', 0),
-        'scaffolding_used': data.get('scaffolding_used', []),
-        'my_summary': summary,
-        'ai_feedback': result,
-        'paragraph_text': text,
-        'previous_context': context,
-    })
-    save_history(history)
     return jsonify({'result': result})
 
 
