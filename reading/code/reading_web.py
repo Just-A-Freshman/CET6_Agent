@@ -16,6 +16,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_PROJECT_ROOT, '.env'))
 
 SQLITE_PATH = os.path.join(_PROJECT_ROOT, '知识库/reading.db')
+JSON_DB_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读段落库.json')
+JSON_NOTES_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读笔记.json')
+JSON_HISTORY_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读练习记录.json')
+JSON_DIALOG_PATH = os.path.join(_PROJECT_ROOT, '知识库/六级阅读对话记录.json')
 API_KEY = os.getenv('DEEPSEEK_API_KEY')
 BASE_URL = 'https://api.deepseek.com/v1'
 MODEL = 'deepseek-chat'
@@ -25,6 +29,89 @@ app = Flask(__name__, template_folder='templates', static_folder='static')
 
 
 # --- Database helpers ---
+
+def ensure_db():
+    """Initialize SQLite DB from JSON files if it doesn't exist."""
+    if os.path.exists(SQLITE_PATH):
+        return
+    # Re-import from migrate_to_sqlite logic
+    import sqlite3
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paragraphs (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, type TEXT NOT NULL,
+            source TEXT NOT NULL, passage_index INTEGER NOT NULL,
+            paragraph_index INTEGER NOT NULL, total_paragraphs INTEGER NOT NULL,
+            paragraph_text TEXT NOT NULL, previous_context TEXT DEFAULT '');
+        CREATE INDEX IF NOT EXISTS idx_paragraphs_type ON paragraphs(type);
+        CREATE INDEX IF NOT EXISTS idx_paragraphs_source ON paragraphs(source);
+        CREATE TABLE IF NOT EXISTS notes (passage_id TEXT PRIMARY KEY, text TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, datetime TEXT NOT NULL,
+            passage_id TEXT, type TEXT, source TEXT, title TEXT,
+            paragraph_index INTEGER, my_summary TEXT, ai_feedback TEXT);
+        CREATE INDEX IF NOT EXISTS idx_history_passage_id ON history(passage_id);
+        CREATE TABLE IF NOT EXISTS scaffolds (
+            history_id INTEGER, tool_name TEXT NOT NULL,
+            PRIMARY KEY (history_id, tool_name));
+        CREATE TABLE IF NOT EXISTS dialogues (
+            passage_id TEXT PRIMARY KEY, messages TEXT NOT NULL DEFAULT '[]');
+    """)
+    # Import paragraphs
+    if os.path.exists(JSON_DB_PATH):
+        with open(JSON_DB_PATH, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        raw = re.sub(r'\\u[dD][89a-fA-F][0-9a-fA-F]{2}', ' ', raw)
+        raw = re.sub(r'\\u[dD][cC][0-9a-fa-f]{2}', ' ', raw)
+        paras = json.loads(raw)
+        data = []
+        for p in paras:
+            data.append((
+                p['id'], p.get('title', ''), p['type'], p['source'],
+                p['passage_index'], p['paragraph_index'], p['total_paragraphs'],
+                clean_text(p.get('paragraph_text', '')),
+                clean_text(p.get('previous_context', '')),
+            ))
+        conn.executemany(
+            "INSERT OR REPLACE INTO paragraphs VALUES (?,?,?,?,?,?,?,?,?)",
+            data
+        )
+    # Import notes
+    if os.path.exists(JSON_NOTES_PATH):
+        with open(JSON_NOTES_PATH, 'r', encoding='utf-8') as f:
+            notes = json.load(f)
+        conn.executemany(
+            "INSERT OR REPLACE INTO notes VALUES (?,?)",
+            [(pid, t) for pid, t in notes.items()]
+        )
+    # Import history + scaffolds
+    if os.path.exists(JSON_HISTORY_PATH):
+        with open(JSON_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        raw = re.sub(r'\\u[dD][89a-fA-F][0-9a-fA-F]{2}', ' ', raw)
+        raw = re.sub(r'\\u[dD][cC][0-9a-fa-f]{2}', ' ', raw)
+        hist = json.loads(raw)
+        for h in hist:
+            cur = conn.execute(
+                "INSERT INTO history (datetime, passage_id, type, source, title, paragraph_index, my_summary, ai_feedback) VALUES (?,?,?,?,?,?,?,?)",
+                (h.get('datetime', ''), h.get('passage_id', ''), h.get('type', ''),
+                 h.get('source', ''), h.get('title', ''), h.get('paragraph_index', 0),
+                 h.get('my_summary', ''), h.get('ai_feedback', ''))
+            )
+            for tool in (h.get('scaffolding_used') or []):
+                conn.execute("INSERT INTO scaffolds VALUES (?,?)", (cur.lastrowid, tool))
+    # Import dialogues
+    if os.path.exists(JSON_DIALOG_PATH):
+        with open(JSON_DIALOG_PATH, 'r', encoding='utf-8') as f:
+            dialogs = json.load(f)
+        conn.executemany(
+            "INSERT OR REPLACE INTO dialogues VALUES (?,?)",
+            [(pid, json.dumps(msgs, ensure_ascii=False)) for pid, msgs in dialogs.items()]
+        )
+    conn.commit()
+    conn.close()
+    print("[db] Initialized from JSON files")
+
 
 def get_db():
     conn = sqlite3.connect(SQLITE_PATH)
