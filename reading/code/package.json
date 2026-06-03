@@ -1,0 +1,8 @@
+{
+  "name": "cet6-reading",
+  "private": true,
+  "description": "CET-6 Reading Practice Web App — frontend dependencies loaded via CDN",
+  "dependencies": {
+    "marked": "^15.0.0"
+  }
+}
