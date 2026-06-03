@@ -489,8 +489,8 @@ HISTORY_BTN.addEventListener('click', async function() {
     HISTORY_LIST.innerHTML = '<p class="empty">暂无练习记录。</p>';
   } else {
     let html = '';
-    // Build reversed list for display, store original index
-    for (let i = historyData.length - 1; i >= 0; i--) {
+    // Already sorted by datetime DESC from backend
+    for (let i = 0; i < historyData.length; i++) {
       const entry = historyData[i];
       html += `<div class="history-entry">
         <div class="h-meta">${entry.datetime} | ${entry.type} | ${entry.title || entry.passage_id}</div>
