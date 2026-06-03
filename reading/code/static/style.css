@@ -546,10 +546,15 @@ button:hover {
 .h-feedback {
   color: var(--text-secondary);
   line-height: 1.6;
+  margin-bottom: 8px;
+}
+
+.h-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 .restore-history-btn {
-  margin-top: 8px;
   font-size: calc(var(--font-size) - 4px);
   padding: 4px 14px;
   background: var(--card-bg);
@@ -561,6 +566,20 @@ button:hover {
 }
 .restore-history-btn:hover {
   background: #e8f0fe;
+}
+
+.delete-history-btn {
+  font-size: calc(var(--font-size) - 4px);
+  padding: 4px 14px;
+  background: var(--card-bg);
+  color: #d32f2f;
+  border: 1px solid #d32f2f;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.delete-history-btn:hover {
+  background: #ffebee;
 }
 
 .empty { color: var(--text-secondary); text-align: center; padding: 20px; }

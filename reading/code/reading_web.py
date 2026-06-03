@@ -388,20 +388,6 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 
-def save_summary_to_history(paragraph_id, ptype, source, title, paragraph_index, summary):
-    save_history_entry(
-        datetime=__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
-        passage_id=paragraph_id,
-        ptype=ptype,
-        source=source,
-        title=title,
-        paragraph_index=paragraph_index,
-        summary=summary,
-        feedback='',
-        scaffolding_used=[],
-    )
-
-
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
     data = request.get_json()
@@ -441,6 +427,7 @@ def api_chat():
                 yield f'data: {json.dumps({"content": content})}\n\n'
 
         # After streaming completes, check for summary marker
+        summary_saved = False
         if '<CET6_SUMMARY>' in full_response:
             try:
                 start = full_response.index('<CET6_SUMMARY>') + len('<CET6_SUMMARY>')
@@ -451,14 +438,20 @@ def api_chat():
                 summary_json = re.sub(r'\s*```$', '', summary_json)
                 info = json.loads(summary_json)
                 if info.get('is_summary'):
-                    save_summary_to_history(
-                        paragraph_id=paragraph_id,
+                    # Extract AI feedback: everything before the marker
+                    feedback = full_response[:full_response.index('<CET6_SUMMARY>')].strip()
+                    save_history_entry(
+                        datetime=__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        passage_id=paragraph_id,
                         ptype=ptype,
                         source=source,
                         title=title,
                         paragraph_index=paragraph_index,
                         summary=info.get('summary_text', ''),
+                        feedback=feedback,
+                        scaffolding_used=[],
                     )
+                    summary_saved = True
                     yield f'data: {json.dumps({"summary_saved": True})}\n\n'
             except Exception as e:
                 print(f"[chat] summary parse error: {e}", file=__import__('sys').stderr)
@@ -555,6 +548,16 @@ def api_context():
 @app.route('/api/history')
 def api_history():
     return jsonify(get_history())
+
+
+@app.route('/api/history/<int:history_id>', methods=['DELETE'])
+def api_delete_history(history_id):
+    conn = get_db()
+    conn.execute("DELETE FROM scaffolds WHERE history_id=?", (history_id,))
+    conn.execute("DELETE FROM history WHERE id=?", (history_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 
 if __name__ == '__main__':

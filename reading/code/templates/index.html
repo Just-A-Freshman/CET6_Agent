@@ -492,11 +492,15 @@ HISTORY_BTN.addEventListener('click', async function() {
     // Already sorted by datetime DESC from backend
     for (let i = 0; i < historyData.length; i++) {
       const entry = historyData[i];
+      const hasFeedback = entry.ai_feedback && entry.ai_feedback.trim().length > 0;
       html += `<div class="history-entry">
         <div class="h-meta">${entry.datetime} | ${entry.type} | ${entry.title || entry.passage_id}</div>
         <div class="h-summary"><strong>我的总结:</strong> ${entry.my_summary}</div>
-        <div class="h-feedback">${md(entry.ai_feedback)}</div>
-        <button class="restore-history-btn" data-hindex="${i}">恢复</button>
+        <div class="h-feedback${hasFeedback ? '' : ' hidden'}"><strong>AI点评:</strong> ${md(entry.ai_feedback || '')}</div>
+        <div class="h-buttons">
+          <button class="restore-history-btn" data-hindex="${i}">恢复</button>
+          <button class="delete-history-btn" data-hid="${entry.id}">删除</button>
+        </div>
       </div>`;
     }
     HISTORY_LIST.innerHTML = html;
@@ -576,6 +580,17 @@ CLOSE_MODAL.addEventListener('click', function() {
 });
 window.addEventListener('click', function(e) {
   if (e.target === HISTORY_MODAL) HISTORY_MODAL.classList.add('hidden');
+});
+
+// Delete history entry with confirmation
+HISTORY_LIST.addEventListener('click', function(e) {
+  const btn = e.target.closest('.delete-history-btn');
+  if (!btn) return;
+  const hid = parseInt(btn.dataset.hid);
+  if (!confirm('确定删除此练习记录？')) return;
+  fetch('/api/history/' + hid, {method: 'DELETE'}).then(function() {
+    HISTORY_BTN.click();
+  });
 });
 
 // --- Canvas drawing module ---
