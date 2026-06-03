@@ -112,6 +112,8 @@ def ensure_db():
     conn.close()
     print("[db] Initialized from JSON files")
 
+# Initialize DB from JSON files on first run
+ensure_db()
 
 def get_db():
     conn = sqlite3.connect(SQLITE_PATH)
